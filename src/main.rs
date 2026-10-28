@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -9,6 +10,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PORT: u16 = 8080;
+
+/// Hard cap on upstream pagination: at most 10 pages of 100 repos are
+/// returned (documented in the README).
+const MAX_PAGES: usize = 10;
 
 #[derive(Clone)]
 struct AppState {
@@ -50,6 +55,7 @@ async fn main() {
     let state = AppState {
         http: reqwest::Client::builder()
             .user_agent("github-repos-api")
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client"),
         github_api_base: reqwest::Url::parse("https://api.github.com")
@@ -85,59 +91,87 @@ async fn list_repos(
 ) -> Response {
     let Query(ReposQuery { username }) = match query {
         Ok(query) => query,
-        Err(_) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "missing required query parameter: username",
-            )
-        }
+        Err(rejection) => return json_error(StatusCode::BAD_REQUEST, rejection.body_text()),
     };
     let username = username.trim();
-    if username.is_empty() {
+    if !is_valid_username(username) {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "missing required query parameter: username",
+            "username must be 1-39 ASCII letters, digits or hyphens",
         );
     }
 
-    let mut url = state.github_api_base.clone();
-    url.path_segments_mut()
+    let mut first_url = state.github_api_base.clone();
+    first_url
+        .path_segments_mut()
         .expect("base URL accepts path segments")
         .push("users")
         .push(username)
         .push("repos");
-    // A single page of 100; larger accounts are truncated (documented in the
-    // README).
-    url.query_pairs_mut().append_pair("per_page", "100");
+    first_url.query_pairs_mut().append_pair("per_page", "100");
 
-    let mut request = state.http.get(url);
-    if let Some(token) = &state.github_token {
-        request = request.bearer_auth(token);
-    }
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(_) => return json_error(StatusCode::BAD_GATEWAY, "failed to reach the GitHub API"),
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        let remaining = response
-            .headers()
-            .get("x-ratelimit-remaining")
-            .and_then(|value| value.to_str().ok());
-        let (status, message) = upstream_error(status, remaining);
-        return json_error(status, message);
-    }
-    let repos: Vec<RepoSummary> = match response.json().await {
-        Ok(repos) => repos,
-        Err(_) => {
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "failed to parse the GitHub API response",
-            )
+    let mut repos = Vec::new();
+    let mut next_url = Some(first_url);
+    for _ in 0..MAX_PAGES {
+        let Some(url) = next_url else {
+            break;
+        };
+        let mut request = state.http.get(url);
+        if let Some(token) = &state.github_token {
+            request = request.bearer_auth(token);
         }
-    };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => return json_error(StatusCode::BAD_GATEWAY, "failed to reach the GitHub API"),
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let remaining = response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok());
+            let (status, message) = upstream_error(status, remaining);
+            return json_error(status, message);
+        }
+        let link = response
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let page: Vec<RepoSummary> = match response.json().await {
+            Ok(page) => page,
+            Err(_) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "failed to parse the GitHub API response",
+                )
+            }
+        };
+        repos.extend(page);
+        next_url = next_page_url(link.as_deref());
+    }
     Json(repos).into_response()
+}
+
+/// GitHub usernames are 1-39 ASCII letters, digits or hyphens; rejecting
+/// everything else also keeps `..` and friends out of the upstream URL path.
+fn is_valid_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= 39
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Extracts the URL of the `rel="next"` page from a GitHub `Link` header.
+fn next_page_url(link: Option<&str>) -> Option<reqwest::Url> {
+    let part = link?
+        .split(',')
+        .find(|part| part.contains("rel=\"next\""))?;
+    let target = part.split(';').next()?.trim();
+    let target = target.strip_prefix('<')?.strip_suffix('>')?;
+    target.parse().ok()
 }
 
 /// Maps a GitHub API error to our status and message. GitHub signals rate
@@ -168,6 +202,7 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::http::header;
     use axum::http::Request;
     use http_body_util::BodyExt;
     use serde_json::json;
@@ -305,7 +340,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             body,
-            json!({"error": "missing required query parameter: username"})
+            json!({"error": "Failed to deserialize query string: missing field `username`"})
         );
     }
 
@@ -325,7 +360,99 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             body,
-            json!({"error": "missing required query parameter: username"})
+            json!({"error": "username must be 1-39 ASCII letters, digits or hyphens"})
+        );
+    }
+
+    #[tokio::test]
+    async fn repos_follows_pagination_and_maps_github_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = Router::new()
+            .route(
+                "/users/octocat/repos",
+                get(move || async move {
+                    (
+                        StatusCode::OK,
+                        [(
+                            header::LINK,
+                            format!(
+                                "<http://{addr}/users/octocat/repos-page-2>; rel=\"next\", <http://{addr}/users/octocat/repos-page-99>; rel=\"last\""
+                            ),
+                        )],
+                        Json(json!([{
+                            "id": 1,
+                            "name": "repo-one",
+                            "full_name": "octocat/repo-one",
+                            "html_url": "https://github.com/octocat/repo-one",
+                            "description": "First",
+                            "language": "Rust",
+                            "stargazers_count": 1,
+                            "fork": false,
+                            "private": false
+                        }])),
+                    )
+                }),
+            )
+            .route(
+                "/users/octocat/repos-page-2",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        Json(json!([{
+                            "id": 2,
+                            "name": "repo-two",
+                            "full_name": "octocat/repo-two",
+                            "html_url": "https://github.com/octocat/repo-two",
+                            "description": null,
+                            "language": null,
+                            "stargazers_count": 0,
+                            "fork": true
+                        }])),
+                    )
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let state = AppState {
+            http: reqwest::Client::new(),
+            github_api_base: reqwest::Url::parse(&format!("http://{addr}")).unwrap(),
+            github_token: None,
+        };
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/repos?username=octocat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            json!([
+                {
+                    "name": "repo-one",
+                    "full_name": "octocat/repo-one",
+                    "html_url": "https://github.com/octocat/repo-one",
+                    "description": "First",
+                    "language": "Rust",
+                    "stargazers_count": 1,
+                    "fork": false
+                },
+                {
+                    "name": "repo-two",
+                    "full_name": "octocat/repo-two",
+                    "html_url": "https://github.com/octocat/repo-two",
+                    "description": null,
+                    "language": null,
+                    "stargazers_count": 0,
+                    "fork": true
+                }
+            ])
         );
     }
 

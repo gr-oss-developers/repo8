@@ -7,10 +7,10 @@ A small REST service that returns the public repositories of a GitHub user.
 
 ### Endpoints
 
-- `GET /repos?username=<user>` — a JSON array of the user's public repos, each with `name`, `full_name`, `html_url`, `description`, `language`, `stargazers_count` and `fork`. Returns at most 100 repos in one page; there is no pagination.
+- `GET /repos?username=<user>` — a JSON array of the user's public repos, each with `name`, `full_name`, `html_url`, `description`, `language`, `stargazers_count` and `fork`. Follows GitHub pagination up to 10 pages, so at most 1000 repos are returned.
 - `GET /health` — returns `200` for readiness polling.
 
-Errors are JSON objects with an `error` field: `404` when the user does not exist, `502` when GitHub rate-limits the request or the upstream call otherwise fails.
+Errors are JSON objects with an `error` field: `400` when the `username` query parameter is missing, blank or malformed, `404` when the user does not exist, `502` when GitHub rate-limits the request or the upstream call otherwise fails.
 
 ### Configuration
 
