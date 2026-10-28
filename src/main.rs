@@ -13,6 +13,7 @@ const DEFAULT_PORT: u16 = 8080;
 #[derive(Clone)]
 struct AppState {
     http: reqwest::Client,
+    github_api_base: reqwest::Url,
     github_token: Option<String>,
 }
 
@@ -51,6 +52,8 @@ async fn main() {
             .user_agent("github-repos-api")
             .build()
             .expect("failed to build HTTP client"),
+        github_api_base: reqwest::Url::parse("https://api.github.com")
+            .expect("hardcoded base URL is valid"),
         github_token: std::env::var("GITHUB_TOKEN")
             .ok()
             .filter(|token| !token.is_empty()),
@@ -97,10 +100,10 @@ async fn list_repos(
         );
     }
 
-    let mut url =
-        reqwest::Url::parse("https://api.github.com/users").expect("hardcoded base URL is valid");
+    let mut url = state.github_api_base.clone();
     url.path_segments_mut()
-        .expect("hardcoded base URL accepts path segments")
+        .expect("base URL accepts path segments")
+        .push("users")
         .push(username)
         .push("repos");
     // A single page of 100; larger accounts are truncated (documented in the
@@ -173,6 +176,7 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             http: reqwest::Client::new(),
+            github_api_base: reqwest::Url::parse("https://api.github.com").unwrap(),
             github_token: None,
         }
     }
@@ -253,6 +257,36 @@ mod tests {
 
         let (status, _) = upstream_error(StatusCode::INTERNAL_SERVER_ERROR, Some("9"));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn repos_with_unknown_user_returns_upstream_404() {
+        let stub = Router::new().route(
+            "/users/no-such-user/repos",
+            get(|| async { (StatusCode::NOT_FOUND, Json(json!({"message": "Not Found"}))) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, stub).await.unwrap() });
+
+        let state = AppState {
+            http: reqwest::Client::new(),
+            github_api_base: reqwest::Url::parse(&format!("http://{addr}")).unwrap(),
+            github_token: None,
+        };
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/repos?username=no-such-user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, json!({"error": "GitHub user not found"}));
     }
 
     #[tokio::test]
